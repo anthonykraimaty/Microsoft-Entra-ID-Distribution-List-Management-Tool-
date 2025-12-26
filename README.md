@@ -1,155 +1,99 @@
-# Distribution List Manager for Microsoft 365 / Entra ID
+# Microsoft Entra ID Distribution List Manager
 
-A graphical and command-line tool to manage distribution lists in your Microsoft 365 organization.
+A GUI and CLI tool for managing Microsoft 365 distribution lists via Microsoft Graph API.
+
+![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)
+![License](https://img.shields.io/badge/License-MIT-green.svg)
+
+## Features
+
+- **GUI Application** - Modern dark-themed interface for easy management
+- **CLI Support** - Full command-line interface for automation and scripting
+- **Bulk Operations** - Import/export members from CSV, Excel, or TXT files
+- **Search** - Find distribution lists and search email memberships across all lists
 
 ## Quick Start
 
 ```bash
-# Install dependencies
+# 1. Install dependencies
 pip install -r requirements.txt
 
-# Configure (copy and edit .env)
-copy .env.example .env
+# 2. Configure credentials
+copy .env.example .env   # Then edit .env with your Azure credentials
 
-# Run the GUI
-python gui.py
-
-# Or use the CLI
-python cli.py --help
+# 3. Run
+python gui.py            # GUI mode
+python cli.py --help     # CLI mode
 ```
 
-## Setup
+## Azure Setup
 
-### 1. Install Dependencies
+### 1. Register an App in Azure Portal
 
-```bash
-pip install -r requirements.txt
-```
-
-### 2. Register Azure AD Application
-
-1. Go to [Azure Portal](https://portal.azure.com) > **Entra ID** > **App registrations** > **New registration**
+1. Go to [Azure Portal](https://portal.azure.com) → **Entra ID** → **App registrations** → **New registration**
 2. Name: `Distribution List Manager`
 3. Account type: **Single tenant**
-4. Redirect URI: **Public client/native** > `http://localhost`
+4. Redirect URI: Leave blank
 
-### 3. Add API Permissions
+### 2. Add API Permissions
 
-In your app registration, go to **API permissions** > **Add a permission** > **Microsoft Graph** > **Application permissions**:
+Go to **API permissions** → **Add a permission** → **Microsoft Graph** → **Application permissions**:
 
-- `Group.ReadWrite.All` - Manage distribution lists
-- `User.Read.All` - Look up users by email
-- `Directory.Read.All` - Read directory data
+| Permission | Purpose |
+|------------|---------|
+| `Group.ReadWrite.All` | Manage distribution lists |
+| `User.Read.All` | Look up users by email |
+| `Directory.Read.All` | Read directory data |
 
-Then click **Grant admin consent**.
+Click **Grant admin consent** after adding permissions.
 
-### 4. Create Client Secret
+### 3. Create Client Secret
 
-Go to **Certificates & secrets** > **New client secret** and copy the value.
+Go to **Certificates & secrets** → **New client secret** → Copy the value.
 
-### 5. Configure Environment
+### 4. Configure Environment
 
-```bash
-cp .env.example .env
-```
+Edit `.env` with your values from the Azure app registration:
 
-Edit `.env` with your values:
 ```
 AZURE_TENANT_ID=your-tenant-id
 AZURE_CLIENT_ID=your-client-id
 AZURE_CLIENT_SECRET=your-client-secret
 ```
 
-## Graphical Interface (GUI)
+## CLI Usage
 
-Launch the GUI with:
 ```bash
-python gui.py
-```
-
-**Features:**
-- View all distribution lists in a searchable list
-- Select a list to view all its members
-- Add single or multiple members (bulk import from CSV/Excel/TXT)
-- Remove selected members
-- Edit list properties (name, description)
-- Export members to CSV, Excel, or TXT
-- Dark theme with modern UI
-
-## Command Line Interface (CLI)
-
-### List all distribution lists
-```bash
+# List all distribution lists
 python cli.py list
-python cli.py list --members    # Include member count
-python cli.py list --search "sales"
-```
 
-### View distribution list details
-```bash
+# Show members of a list
 python cli.py show sales@company.com
-python cli.py show <list-id>
-```
 
-### Add members
-```bash
-python cli.py add sales@company.com john@company.com
-```
+# Add/remove members
+python cli.py add sales@company.com user@company.com
+python cli.py remove sales@company.com user@company.com
 
-### Remove members
-```bash
-python cli.py remove sales@company.com john@company.com
-python cli.py remove sales@company.com john@company.com --force
-```
-
-### Import members from file
-```bash
-# From text file (one email per line)
-python cli.py import sales@company.com members.txt
-
-# From CSV
+# Import from file
 python cli.py import sales@company.com members.csv --column email
 
-# From Excel
-python cli.py import sales@company.com members.xlsx --column email
-```
+# Export members
+python cli.py export sales@company.com --format csv
 
-### Export members
-```bash
-python cli.py export sales@company.com
-python cli.py export sales@company.com --output members.csv
-python cli.py export sales@company.com --format xlsx
-python cli.py export sales@company.com --format txt
-```
-
-### Create distribution list
-```bash
-python cli.py create "Sales Team" sales --description "Sales department"
-```
-
-### Update distribution list
-```bash
-python cli.py update sales@company.com --name "Sales Department"
-python cli.py update sales@company.com --description "New description"
-```
-
-### Delete distribution list
-```bash
-python cli.py delete sales@company.com
+# Create/delete lists
+python cli.py create "Sales Team" sales-team --description "Sales department"
 python cli.py delete sales@company.com --force
+
+# Find user's memberships
+python cli.py user-lists user@company.com
 ```
 
-### View user's memberships
-```bash
-python cli.py user-lists john@company.com
-```
+## Requirements
 
-## Required Permissions Summary
+- Python 3.8+
+- Microsoft 365 tenant with admin access
+- Azure AD app registration with appropriate permissions
 
-| Permission | Type | Purpose |
-|------------|------|---------|
-| Group.ReadWrite.All | Application | Create, read, update, delete groups |
-| User.Read.All | Application | Find users by email |
-| Directory.Read.All | Application | Read directory objects |
+## License
 
-**Note:** Admin consent is required for application permissions.
+MIT
