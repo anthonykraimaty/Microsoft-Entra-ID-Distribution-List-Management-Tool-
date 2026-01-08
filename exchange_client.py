@@ -182,13 +182,94 @@ if ($?) {{ Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContin
         return members
 
     def add_member(self, identity: str, member_email: str) -> bool:
-        """Add a member to a distribution group."""
+        """Add a member to a distribution group. Creates mail contact for external users if needed."""
         logger.info(f"Adding {member_email} to {identity}")
 
+        # Try to add directly first
         cmd = f"Add-DistributionGroupMember -Identity '{identity}' -Member '{member_email}' -Confirm:$false"
-        self._run_powershell(cmd)
+        try:
+            self._run_powershell(cmd)
+            logger.info(f"Successfully added {member_email}")
+            return True
+        except RuntimeError as e:
+            error_str = str(e)
+            # If user not found, try creating a mail contact first
+            if "Couldn't find object" in error_str or "couldn't be found" in error_str.lower():
+                logger.info(f"User not found, creating mail contact for {member_email}...")
+                return self._add_external_member(identity, member_email)
+            raise
 
-        logger.info(f"Successfully added {member_email}")
+    def _add_external_member(self, identity: str, member_email: str) -> bool:
+        """Create a mail contact for external user and add to distribution group.
+        First checks if it's an existing distribution group or recipient."""
+
+        # First, check if this is an existing distribution group
+        check_dg_cmd = f"Get-DistributionGroup -Identity '{member_email}' -ErrorAction SilentlyContinue"
+        try:
+            result = self._run_powershell(check_dg_cmd)
+            if result.strip():
+                # It's a distribution group - add it directly by its identity
+                logger.info(f"{member_email} is a distribution group, adding directly")
+                add_cmd = f"Add-DistributionGroupMember -Identity '{identity}' -Member '{member_email}' -Confirm:$false"
+                self._run_powershell(add_cmd)
+                logger.info(f"Successfully added distribution group {member_email}")
+                return True
+        except RuntimeError:
+            pass  # Not a distribution group, continue to check other types
+
+        # Check if it's any existing recipient (mailbox, mail user, etc.)
+        check_recipient_cmd = f"Get-Recipient -Identity '{member_email}' -ErrorAction SilentlyContinue"
+        try:
+            result = self._run_powershell(check_recipient_cmd)
+            if result.strip():
+                # Found as a recipient - might need time to sync, try adding
+                logger.info(f"{member_email} found as recipient, attempting to add")
+                add_cmd = f"Add-DistributionGroupMember -Identity '{identity}' -Member '{member_email}' -Confirm:$false"
+                self._run_powershell(add_cmd)
+                logger.info(f"Successfully added recipient {member_email}")
+                return True
+        except RuntimeError:
+            pass  # Not found as recipient either
+
+        # Use full email as unique name to avoid conflicts
+        display_name = member_email  # Use full email as name for uniqueness
+
+        # Create alias from email, removing invalid chars and making unique
+        alias = member_email.replace("@", "_at_").replace(".", "_")[:64]
+
+        # Check if contact already exists by external email address
+        check_cmd = f"Get-MailContact -Filter \"ExternalEmailAddress -eq '{member_email}'\" -ErrorAction SilentlyContinue"
+        try:
+            result = self._run_powershell(check_cmd)
+            if result.strip():
+                # Contact already exists, just add to group
+                logger.info(f"Mail contact already exists for {member_email}")
+            else:
+                # Contact doesn't exist, create it
+                create_cmd = (
+                    f"New-MailContact -Name '{display_name}' -ExternalEmailAddress '{member_email}' "
+                    f"-Alias '{alias}' -ErrorAction Stop"
+                )
+                self._run_powershell(create_cmd)
+                logger.info(f"Created mail contact for {member_email}")
+        except RuntimeError as e:
+            # If check failed, try to create anyway
+            if "already exists" not in str(e).lower():
+                try:
+                    create_cmd = (
+                        f"New-MailContact -Name '{display_name}' -ExternalEmailAddress '{member_email}' "
+                        f"-Alias '{alias}' -ErrorAction Stop"
+                    )
+                    self._run_powershell(create_cmd)
+                    logger.info(f"Created mail contact for {member_email}")
+                except RuntimeError as create_error:
+                    if "already exists" not in str(create_error).lower():
+                        raise
+
+        # Now add the contact to the distribution group
+        add_cmd = f"Add-DistributionGroupMember -Identity '{identity}' -Member '{member_email}' -Confirm:$false"
+        self._run_powershell(add_cmd)
+        logger.info(f"Successfully added external member {member_email}")
         return True
 
     def remove_member(self, identity: str, member_email: str) -> bool:
@@ -226,3 +307,80 @@ if ($?) {{ Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContin
                 results["failed"].append({"email": email, "error": str(e)})
 
         return results
+
+    def create_distribution_group(self, name: str, alias: str, primary_smtp: str) -> bool:
+        """Create a new distribution group."""
+        logger.info(f"Creating distribution group: {name} ({primary_smtp})")
+
+        cmd = (
+            f"New-DistributionGroup -Name '{name}' -Alias '{alias}' "
+            f"-PrimarySmtpAddress '{primary_smtp}' -Type 'Distribution' "
+            f"-MemberDepartRestriction 'Closed' -MemberJoinRestriction 'Closed'"
+        )
+        self._run_powershell(cmd)
+
+        logger.info(f"Successfully created distribution group: {primary_smtp}")
+        return True
+
+    def update_distribution_group(
+        self,
+        identity: str,
+        display_name: str = None,
+        primary_smtp: str = None,
+        alias: str = None
+    ) -> bool:
+        """Update distribution group properties via Exchange PowerShell."""
+        logger.info(f"Updating distribution group: {identity}")
+
+        # If changing email, check for conflicting mail contacts and remove them
+        if primary_smtp:
+            self._remove_conflicting_contact(primary_smtp)
+
+        # Build Set-DistributionGroup command with only provided parameters
+        params = []
+        if display_name:
+            params.append(f"-DisplayName '{display_name}'")
+        if primary_smtp:
+            params.append(f"-PrimarySmtpAddress '{primary_smtp}'")
+        if alias:
+            params.append(f"-Alias '{alias}'")
+
+        if not params:
+            logger.info("No parameters to update")
+            return True
+
+        cmd = f"Set-DistributionGroup -Identity '{identity}' {' '.join(params)}"
+        self._run_powershell(cmd)
+
+        logger.info(f"Successfully updated distribution group: {identity}")
+        return True
+
+    def _remove_conflicting_contact(self, email: str) -> bool:
+        """Remove a mail contact that conflicts with an email address."""
+        logger.info(f"Checking for conflicting mail contact: {email}")
+
+        # Check if a mail contact exists with this email
+        check_cmd = f"Get-MailContact -Identity '{email}' -ErrorAction SilentlyContinue"
+        try:
+            result = self._run_powershell(check_cmd)
+            if result.strip():
+                # Mail contact exists, remove it
+                logger.info(f"Found conflicting mail contact, removing: {email}")
+                remove_cmd = f"Remove-MailContact -Identity '{email}' -Confirm:$false"
+                self._run_powershell(remove_cmd)
+                logger.info(f"Removed conflicting mail contact: {email}")
+                return True
+        except RuntimeError:
+            pass  # No contact found or error checking
+
+        return False
+
+    def delete_distribution_group(self, identity: str) -> bool:
+        """Delete a distribution group."""
+        logger.info(f"Deleting distribution group: {identity}")
+
+        cmd = f"Remove-DistributionGroup -Identity '{identity}' -Confirm:$false"
+        self._run_powershell(cmd)
+
+        logger.info(f"Successfully deleted distribution group: {identity}")
+        return True

@@ -12,6 +12,7 @@ from typing import Optional, Callable
 from dataclasses import dataclass
 
 from distribution_list_manager import DistributionListManager, DistributionList, Member
+from exchange_client import ExchangeClient
 
 # Setup logging
 logging.basicConfig(
@@ -168,7 +169,7 @@ class ProgressDialog(ctk.CTkToplevel):
         return self._cancelled
 
     def update_progress(self, current: int, status_text: str = None):
-        """Update progress bar and status text."""
+        """Update progress bar and status text. Thread-safe via self.after()."""
         self.current = current
         progress_value = current / self.total if self.total > 0 else 0
         self.progress.set(progress_value)
@@ -178,12 +179,14 @@ class ProgressDialog(ctk.CTkToplevel):
         else:
             self.status_label.configure(text=f"{current} / {self.total}")
 
-        self.update()
+        # Use update_idletasks() instead of update() to avoid recursion
+        # update_idletasks() only processes display updates, not new events
+        self.update_idletasks()
 
     def set_title(self, title: str):
         """Update the title label."""
         self.title_label.configure(text=title)
-        self.update()
+        self.update_idletasks()
 
 
 class AddMemberDialog(ctk.CTkToplevel):
@@ -229,6 +232,128 @@ class AddMemberDialog(ctk.CTkToplevel):
             self.destroy()
         else:
             messagebox.showerror("Invalid Email", "Please enter a valid email address.")
+
+
+class AddGroupDialog(ctk.CTkToplevel):
+    """Dialog for adding an existing distribution group as a member."""
+
+    def __init__(self, parent, groups: list, current_group_id: str, on_submit: Callable[[str], None]):
+        super().__init__(parent)
+        self.title("Add Group as Member")
+        self.geometry("450x400")
+        self.resizable(False, True)
+        self.transient(parent)
+        self.grab_set()
+
+        self.on_submit = on_submit
+        self.groups = groups
+        self.current_group_id = current_group_id
+        self.filtered_groups = []
+
+        # Center on parent
+        self.update_idletasks()
+        x = parent.winfo_x() + (parent.winfo_width() - 450) // 2
+        y = parent.winfo_y() + (parent.winfo_height() - 400) // 2
+        self.geometry(f"+{x}+{y}")
+
+        # Search input
+        ctk.CTkLabel(self, text="Search Groups:", font=ctk.CTkFont(size=14)).pack(pady=(15, 5))
+        self.search_entry = ctk.CTkEntry(self, width=400, placeholder_text="Type to filter groups...")
+        self.search_entry.pack(pady=5, padx=20)
+        self.search_entry.bind("<KeyRelease>", self._on_search)
+        self.search_entry.focus()
+
+        # Groups list
+        ctk.CTkLabel(self, text="Select a group to add:", font=ctk.CTkFont(size=12)).pack(pady=(10, 5))
+
+        # Frame for listbox with scrollbar
+        list_frame = ctk.CTkFrame(self, fg_color="transparent")
+        list_frame.pack(pady=5, padx=20, fill="both", expand=True)
+
+        # Use CTkScrollableFrame for the list
+        self.scroll_frame = ctk.CTkScrollableFrame(list_frame, width=380, height=200)
+        self.scroll_frame.pack(fill="both", expand=True)
+
+        self.group_buttons = []
+        self.selected_group = None
+
+        self._populate_groups()
+
+        # Buttons
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(pady=15)
+
+        self.add_btn = ctk.CTkButton(btn_frame, text="Add Group", command=self._submit, width=100)
+        self.add_btn.pack(side="left", padx=5)
+        ctk.CTkButton(btn_frame, text="Cancel", command=self.destroy, width=100,
+                      fg_color="gray", hover_color="darkgray").pack(side="left", padx=5)
+
+        self.bind("<Escape>", lambda e: self.destroy())
+
+    def _populate_groups(self, filter_text: str = ""):
+        """Populate the groups list, optionally filtered."""
+        # Clear existing buttons
+        for btn in self.group_buttons:
+            btn.destroy()
+        self.group_buttons = []
+
+        filter_lower = filter_text.lower()
+        self.filtered_groups = []
+
+        for group in self.groups:
+            # Skip the current group (can't add a group to itself)
+            if group.id == self.current_group_id:
+                continue
+
+            # Apply filter
+            if filter_text:
+                if filter_lower not in group.display_name.lower() and filter_lower not in group.mail.lower():
+                    continue
+
+            self.filtered_groups.append(group)
+
+            # Create a button for each group
+            btn = ctk.CTkButton(
+                self.scroll_frame,
+                text=f"{group.display_name}\n{group.mail}",
+                anchor="w",
+                height=50,
+                fg_color="transparent",
+                text_color=("gray10", "gray90"),
+                hover_color=("gray70", "gray30"),
+                command=lambda g=group: self._select_group(g)
+            )
+            btn.pack(fill="x", pady=2, padx=5)
+            self.group_buttons.append(btn)
+
+        if not self.filtered_groups:
+            no_results = ctk.CTkLabel(self.scroll_frame, text="No groups found", text_color="gray")
+            no_results.pack(pady=20)
+            self.group_buttons.append(no_results)
+
+    def _select_group(self, group):
+        """Handle group selection."""
+        self.selected_group = group
+
+        # Update button colors to show selection
+        for btn in self.group_buttons:
+            if isinstance(btn, ctk.CTkButton):
+                if btn.cget("text").endswith(group.mail):
+                    btn.configure(fg_color=("green", "darkgreen"))
+                else:
+                    btn.configure(fg_color="transparent")
+
+    def _on_search(self, event=None):
+        """Handle search input."""
+        self.selected_group = None
+        self._populate_groups(self.search_entry.get().strip())
+
+    def _submit(self):
+        if self.selected_group:
+            self.on_submit(self.selected_group.mail)
+            self.destroy()
+        else:
+            messagebox.showwarning("No Selection", "Please select a group to add.")
 
 
 class BulkAddDialog(ctk.CTkToplevel):
@@ -389,10 +514,10 @@ class EditListDialog(ctk.CTkToplevel):
             return None
 
         desc = self.desc_entry.get().strip()
-        # Extract mail nickname (part before @)
-        mail_nickname = email.split("@")[0] if email != self.current_mail else None
+        # Pass full email if changed, None otherwise
+        new_email = email if email != self.current_mail else None
 
-        return name, desc, mail_nickname
+        return name, desc, new_email
 
     def _submit(self):
         """Save and close."""
@@ -475,6 +600,100 @@ class CreateListDialog(ctk.CTkToplevel):
 
         self.on_submit(name, email_alias, desc)
         self.destroy()
+
+
+class ConfirmDeleteDialog(ctk.CTkToplevel):
+    """Dialog requiring user to type DELETE to confirm destructive operation."""
+
+    def __init__(self, parent, message: str):
+        super().__init__(parent)
+        self.title("Confirm Deletion")
+        self.geometry("400x180")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+
+        self.confirmed = False
+
+        # Center on parent
+        self.update_idletasks()
+        x = parent.winfo_x() + (parent.winfo_width() - 400) // 2
+        y = parent.winfo_y() + (parent.winfo_height() - 180) // 2
+        self.geometry(f"+{x}+{y}")
+
+        # Warning message
+        ctk.CTkLabel(self, text=message, font=ctk.CTkFont(size=13),
+                     text_color="orange", wraplength=350).pack(pady=(20, 10))
+
+        # Entry for typing DELETE
+        self.entry = ctk.CTkEntry(self, width=200, placeholder_text="Type DELETE here")
+        self.entry.pack(pady=10)
+
+        # Buttons
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(pady=15)
+
+        ctk.CTkButton(btn_frame, text="Confirm", command=self._confirm, width=100,
+                      fg_color="#c0392b", hover_color="#e74c3c").pack(side="left", padx=5)
+        ctk.CTkButton(btn_frame, text="Cancel", command=self.destroy, width=100,
+                      fg_color="gray", hover_color="darkgray").pack(side="left", padx=5)
+
+        self.entry.focus()
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.bind("<Return>", lambda e: self._confirm())
+
+    def _confirm(self):
+        if self.entry.get().strip().upper() == "DELETE":
+            self.confirmed = True
+            self.destroy()
+        else:
+            messagebox.showerror("Invalid", "You must type DELETE to confirm.")
+
+
+class ErrorLogDialog(ctk.CTkToplevel):
+    """Dialog showing copyable error log."""
+
+    def __init__(self, parent, title: str, message: str, errors: list):
+        super().__init__(parent)
+        self.title(title)
+        self.geometry("600x400")
+        self.resizable(True, True)
+        self.transient(parent)
+        self.grab_set()
+
+        # Center on parent
+        self.update_idletasks()
+        x = parent.winfo_x() + (parent.winfo_width() - 600) // 2
+        y = parent.winfo_y() + (parent.winfo_height() - 400) // 2
+        self.geometry(f"+{x}+{y}")
+
+        # Summary message
+        ctk.CTkLabel(self, text=message, font=ctk.CTkFont(size=13),
+                     wraplength=550).pack(pady=(15, 10), padx=10)
+
+        # Scrollable text area for errors (copyable)
+        self.textbox = ctk.CTkTextbox(self, width=560, height=280)
+        self.textbox.pack(pady=10, padx=20, fill="both", expand=True)
+
+        # Insert all errors
+        error_text = "\n".join(errors)
+        self.textbox.insert("1.0", error_text)
+
+        # Buttons
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(pady=10)
+
+        ctk.CTkButton(btn_frame, text="Copy to Clipboard", command=self._copy, width=130,
+                      fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"]).pack(side="left", padx=5)
+        ctk.CTkButton(btn_frame, text="Close", command=self.destroy, width=100,
+                      fg_color="gray", hover_color="darkgray").pack(side="left", padx=5)
+
+        self.bind("<Escape>", lambda e: self.destroy())
+
+    def _copy(self):
+        self.clipboard_clear()
+        self.clipboard_append(self.textbox.get("1.0", "end-1c"))
+        messagebox.showinfo("Copied", "Errors copied to clipboard.")
 
 
 class EditMemberDialog(ctk.CTkToplevel):
@@ -763,8 +982,8 @@ class DistributionListManagerGUI(ctk.CTk):
         file_menu.add_separator()
         file_menu.add_command(label="Export All Lists to CSV...", command=self._export_all_lists)
         file_menu.add_separator()
-        file_menu.add_command(label="Import from CSV...", command=self._import_from_csv)
-        file_menu.add_command(label="Clear and Import from CSV...", command=self._clear_and_import_from_csv)
+        file_menu.add_command(label="Import from XLSX/CSV...", command=self._import_from_csv)
+        file_menu.add_command(label="Delete All and Import from XLSX/CSV...", command=self._clear_and_import_from_csv)
         file_menu.add_separator()
         file_menu.add_command(label="Refresh", command=self._refresh_lists)
         file_menu.add_separator()
@@ -895,6 +1114,11 @@ class DistributionListManagerGUI(ctk.CTk):
                                            state="disabled", width=120,
                                            fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"])
         self.bulk_add_btn.pack(side="left", padx=5)
+
+        self.add_group_btn = ctk.CTkButton(toolbar, text="+ Add Group", command=self._add_group,
+                                            state="disabled", width=100,
+                                            fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"])
+        self.add_group_btn.pack(side="left", padx=5)
 
         self.remove_btn = ctk.CTkButton(toolbar, text="Remove Selected", command=self._remove_member,
                                          state="disabled", width=130,
@@ -1259,6 +1483,7 @@ class DistributionListManagerGUI(ctk.CTk):
             self.edit_list_btn.configure(state="normal")
             self.add_btn.configure(state="normal")
             self.bulk_add_btn.configure(state="normal")
+            self.add_group_btn.configure(state="normal")
             self.export_btn.configure(state="normal")
 
     def _show_list_context_menu(self, event):
@@ -1328,6 +1553,7 @@ class DistributionListManagerGUI(ctk.CTk):
         self.edit_list_btn.configure(state="disabled")
         self.add_btn.configure(state="disabled")
         self.bulk_add_btn.configure(state="disabled")
+        self.add_group_btn.configure(state="disabled")
         self.export_btn.configure(state="disabled")
         self.remove_btn.configure(state="disabled")
         self._refresh_lists()
@@ -1682,6 +1908,16 @@ class DistributionListManagerGUI(ctk.CTk):
         messagebox.showinfo("Success", f"Added {email} to {self.current_list.display_name}")
         self._load_members()
 
+    def _add_group(self):
+        """Show dialog to add an existing group as a member."""
+        if not self.current_list:
+            return
+
+        def on_submit(group_email: str):
+            self._do_add_member(group_email)
+
+        AddGroupDialog(self, self.distribution_lists, self.current_list.id, on_submit)
+
     def _bulk_add(self):
         """Show bulk add dialog."""
         if not self.current_list:
@@ -1897,15 +2133,27 @@ class DistributionListManagerGUI(ctk.CTk):
 
         EditListDialog(self, self.current_list, on_submit)
 
-    def _do_update_list(self, name: str, description: str, mail_nickname: str = None):
-        """Update the current list."""
-        if not self.manager or not self.current_list:
+    def _do_update_list(self, name: str, description: str, new_email: str = None):
+        """Update the current list using Exchange PowerShell."""
+        if not self.current_list:
             return
 
         def do_update():
             try:
-                self.manager.update_list(self.current_list.id, name, description, mail_nickname)
-                self.after(0, lambda: self._on_list_updated(name, mail_nickname))
+                # Use Exchange PowerShell to update distribution group
+                exchange = ExchangeClient()
+                exchange.update_distribution_group(
+                    identity=self.current_list.mail,
+                    display_name=name,
+                    primary_smtp=new_email
+                )
+                # Update description via Graph API if we have a manager (description not supported in Exchange PS easily)
+                if self.manager and description is not None:
+                    try:
+                        self.manager.update_list(self.current_list.id, description=description)
+                    except:
+                        pass  # Ignore description update errors
+                self.after(0, lambda: self._on_list_updated(name, new_email))
             except Exception as e:
                 error_msg = str(e)
                 self.after(0, lambda msg=error_msg: messagebox.showerror("Error", f"Failed to update: {msg}"))
@@ -1922,19 +2170,47 @@ class DistributionListManagerGUI(ctk.CTk):
 
         self.after(100, check_thread)
 
-    def _on_list_updated(self, new_name: str, mail_nickname: str = None):
+    def _on_list_updated(self, new_name: str, new_email: str = None):
         """Handle list updated."""
-        if mail_nickname:
+        old_email = self.current_list.mail if self.current_list else None
+
+        if new_email:
             messagebox.showinfo("Success", f"Distribution list updated.\nNote: Email change may take a few minutes to propagate.")
         else:
             messagebox.showinfo("Success", "Distribution list updated")
         self.members_header.configure(text=f"Members - {new_name}")
 
-        # Update cache with new name
+        # Update cache with new name and email
         if self.current_list and self.current_list.id in self.members_cache:
             self.members_cache[self.current_list.id]["dl"].display_name = new_name
+            if new_email:
+                self.members_cache[self.current_list.id]["dl"].mail = new_email
+
+        # If email changed, update all cached lists that had the old email as a member
+        if new_email and old_email and new_email != old_email:
+            self._update_cache_member_email(old_email, new_email)
 
         self._refresh_lists()
+
+    def _update_cache_member_email(self, old_email: str, new_email: str):
+        """Update all cached lists that have old_email as a member to use new_email."""
+        old_email_lower = old_email.lower()
+        updated_lists = []
+
+        for list_id, data in self.members_cache.items():
+            # Update in members list (email strings)
+            for i, member_email in enumerate(data["members"]):
+                if member_email.lower() == old_email_lower:
+                    data["members"][i] = new_email
+                    updated_lists.append(data["dl"].display_name if "dl" in data else list_id)
+
+            # Update in member_objects list
+            for member in data.get("member_objects", []):
+                if member.email.lower() == old_email_lower:
+                    member.email = new_email
+
+        if updated_lists:
+            logger.info(f"Updated member email from {old_email} to {new_email} in {len(updated_lists)} lists: {updated_lists}")
 
     def _export_members(self):
         """Export members to file."""
@@ -2050,14 +2326,14 @@ class DistributionListManagerGUI(ctk.CTk):
         )
 
     def _import_from_csv(self):
-        """Import members to distribution lists from CSV file."""
+        """Import members to distribution lists from CSV/XLSX file."""
         if not self.manager:
             messagebox.showwarning("Not Connected", "Please wait for connection.")
             return
 
         file_path = filedialog.askopenfilename(
-            title="Import from CSV",
-            filetypes=[("CSV files", "*.csv")]
+            title="Import from XLSX/CSV",
+            filetypes=[("Excel files", "*.xlsx"), ("CSV files", "*.csv"), ("All files", "*.*")]
         )
 
         if not file_path:
@@ -2065,7 +2341,10 @@ class DistributionListManagerGUI(ctk.CTk):
 
         try:
             import pandas as pd
-            df = pd.read_csv(file_path)
+            if file_path.endswith('.xlsx'):
+                df = pd.read_excel(file_path)
+            else:
+                df = pd.read_csv(file_path)
 
             # Show preview
             lists_to_import = list(df.columns)
@@ -2085,63 +2364,85 @@ class DistributionListManagerGUI(ctk.CTk):
             self._do_import_csv(df)
 
         except Exception as e:
-            messagebox.showerror("Import Error", f"Failed to read CSV: {e}")
+            messagebox.showerror("Import Error", f"Failed to read file: {e}")
 
     def _do_import_csv(self, df):
-        """Execute the CSV import."""
+        """Execute the CSV/XLSX import with parallel threading."""
         import pandas as pd
+        from concurrent.futures import ThreadPoolExecutor
+        import threading as th
 
         # Count total emails to process
         total_emails = sum(df[col].notna().sum() for col in df.columns)
-        progress_dialog = ProgressDialog(self, "Importing from CSV", total_emails)
+        progress_dialog = ProgressDialog(self, "Importing", total_emails)
 
         def do_import():
             results = {"success": 0, "skipped": 0, "failed": 0, "errors": []}
-            processed = 0
+            results_lock = th.Lock()
+            processed = [0]
+            processed_lock = th.Lock()
+
+            def update_processed():
+                with processed_lock:
+                    processed[0] += 1
+                    return processed[0]
+
+            # Build list of all tasks: (dl, email, current_emails_set)
+            tasks = []
+            list_members_cache = {}  # Cache current members per list
 
             for list_email in df.columns:
-                if progress_dialog.is_cancelled():
-                    break
-
                 # Find the distribution list
                 dl = self.manager.get_by_email(list_email)
                 if not dl:
-                    results["errors"].append(f"List not found: {list_email}")
+                    with results_lock:
+                        results["errors"].append(f"List not found: {list_email}")
                     continue
 
-                # Get current members
-                current_members = self.manager.get_members(dl.id)
-                current_emails = {m.email.lower() for m in current_members}
+                # Get current members (cache to avoid duplicate API calls)
+                if dl.id not in list_members_cache:
+                    current_members = self.manager.get_members(dl.id)
+                    list_members_cache[dl.id] = {m.email.lower() for m in current_members}
+
+                current_emails = list_members_cache[dl.id]
 
                 # Get emails to add from CSV
                 emails_to_add = df[list_email].dropna().tolist()
-
                 for email in emails_to_add:
-                    if progress_dialog.is_cancelled():
-                        break
-
                     email = str(email).strip()
-                    processed += 1
+                    if email and "@" in email:
+                        tasks.append((dl, email, current_emails))
 
-                    if not email or "@" not in email:
-                        continue
+            # Determine thread count based on total emails
+            num_threads = 15 if len(tasks) > 30 else 10
 
-                    self.after(0, lambda p=processed, e=email, ln=dl.display_name: progress_dialog.update_progress(
-                        p, f"Adding {e} to {ln[:20]}..."
-                    ))
+            def add_member_task(task):
+                dl, email, current_emails = task
+                if progress_dialog.is_cancelled():
+                    return
 
-                    # Skip if already a member
-                    if email.lower() in current_emails:
+                p = update_processed()
+                self.after(0, lambda e=email, ln=dl.display_name: progress_dialog.update_progress(
+                    p, f"Adding {e[:25]} to {ln[:15]}..."
+                ))
+
+                # Skip if already a member
+                if email.lower() in current_emails:
+                    with results_lock:
                         results["skipped"] += 1
-                        continue
+                    return
 
-                    try:
-                        self.manager.add_member(dl.id, email)
+                try:
+                    self.manager.add_member(dl.id, email)
+                    with results_lock:
                         results["success"] += 1
-                        current_emails.add(email.lower())  # Track added
-                    except Exception as e:
+                except Exception as e:
+                    with results_lock:
                         results["failed"] += 1
-                        results["errors"].append(f"{email}: {str(e)[:50]}")
+                        results["errors"].append(f"{email}: {str(e)}")
+
+            with ThreadPoolExecutor(max_workers=num_threads) as executor:
+                executor.map(add_member_task, tasks)
 
             self.after(0, lambda: self._on_import_complete(results, progress_dialog))
 
@@ -2175,14 +2476,14 @@ class DistributionListManagerGUI(ctk.CTk):
         self._reload_cache()
 
     def _clear_and_import_from_csv(self):
-        """Clear all members from lists and import fresh from CSV."""
+        """Delete ALL distribution lists and import fresh from CSV/XLSX."""
         if not self.manager:
             messagebox.showwarning("Not Connected", "Please wait for connection.")
             return
 
         file_path = filedialog.askopenfilename(
-            title="Clear and Import from CSV",
-            filetypes=[("CSV files", "*.csv")]
+            title="Delete All and Import from XLSX/CSV",
+            filetypes=[("Excel files", "*.xlsx"), ("CSV files", "*.csv"), ("All files", "*.*")]
         )
 
         if not file_path:
@@ -2190,120 +2491,217 @@ class DistributionListManagerGUI(ctk.CTk):
 
         try:
             import pandas as pd
-            df = pd.read_csv(file_path)
+            if file_path.endswith('.xlsx'):
+                df = pd.read_excel(file_path)
+            else:
+                df = pd.read_csv(file_path)
 
-            # Show preview with warning
-            lists_to_import = list(df.columns)
-            total_emails = sum(df[col].notna().sum() for col in df.columns)
+            # Column headers are list emails, rows below are members
+            lists_to_create = list(df.columns)
+            total_members = sum(df[col].notna().sum() for col in df.columns)
+
+            # Get current lists that will be deleted
+            current_lists = self.manager.list_all()
 
             confirm = messagebox.askyesno(
-                "WARNING: Clear and Import",
-                f"⚠️ This will REMOVE ALL existing members from {len(lists_to_import)} list(s) "
-                f"and replace them with CSV content!\n\n"
-                f"Lists to clear and refill:\n" +
-                "\n".join(f"  - {name}" for name in lists_to_import[:10]) +
-                ("\n  ..." if len(lists_to_import) > 10 else "") +
-                f"\n\nNew members to add: {total_emails}\n\n"
-                f"This action cannot be undone!\nAre you sure?",
+                "WARNING: Delete All and Import",
+                f"DESTRUCTIVE OPERATION!\n\n"
+                f"This will DELETE ALL {len(current_lists)} existing distribution lists "
+                f"and create {len(lists_to_create)} new ones from the file.\n\n"
+                f"Lists to DELETE:\n" +
+                "\n".join(f"  - {dl.mail}" for dl in current_lists[:5]) +
+                (f"\n  ...and {len(current_lists) - 5} more" if len(current_lists) > 5 else "") +
+                f"\n\nLists to CREATE:\n" +
+                "\n".join(f"  - {name}" for name in lists_to_create[:5]) +
+                (f"\n  ...and {len(lists_to_create) - 5} more" if len(lists_to_create) > 5 else "") +
+                f"\n\nTotal members to add: {total_members}\n\n"
+                f"This action CANNOT be undone!",
                 icon="warning"
             )
 
             if not confirm:
                 return
 
-            # Double confirm for safety
-            confirm2 = messagebox.askyesno(
-                "Final Confirmation",
-                "Are you REALLY sure you want to clear all members and replace them?",
-                icon="warning"
+            # Require typing "DELETE" to confirm
+            confirm_dialog = ConfirmDeleteDialog(
+                self,
+                f"You are about to delete {len(current_lists)} distribution lists.\n"
+                f"Type DELETE to confirm:"
             )
+            self.wait_window(confirm_dialog)
 
-            if not confirm2:
+            if not confirm_dialog.confirmed:
                 return
 
-            self._do_clear_and_import_csv(df)
+            self._do_clear_and_import_csv(df, current_lists)
 
         except Exception as e:
-            messagebox.showerror("Import Error", f"Failed to read CSV: {e}")
+            messagebox.showerror("Import Error", f"Failed to read file: {e}")
 
-    def _do_clear_and_import_csv(self, df):
-        """Execute the clear and import operation."""
+    def _do_clear_and_import_csv(self, df, current_lists):
+        """Execute the delete all and import operation using Exchange PowerShell for creation."""
         import pandas as pd
+        import time
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import threading as th
 
-        # Count total emails to add (we'll update progress as we discover members to remove)
-        total_to_add = sum(df[col].notna().sum() for col in df.columns)
-        # Initial estimate - will be updated as we discover members
-        progress_dialog = ProgressDialog(self, "Clear and Import", total_to_add)
+        # Calculate total operations: delete existing + create new + add members
+        total_members = sum(df[col].notna().sum() for col in df.columns)
+        total_operations = len(current_lists) + len(df.columns) + total_members
+
+        progress_dialog = ProgressDialog(self, "Delete and Import", total_operations)
 
         def do_clear_and_import():
             results = {
-                "lists_processed": 0,
-                "removed": 0,
-                "added": 0,
-                "failed_remove": 0,
+                "lists_deleted": 0,
+                "lists_created": 0,
+                "members_added": 0,
+                "failed_delete": 0,
+                "failed_create": 0,
                 "failed_add": 0,
                 "errors": []
             }
-            processed = 0
-            total_operations = total_to_add  # Will be updated
+            results_lock = th.Lock()
+            processed = [0]  # Use list for mutable counter in threads
+            processed_lock = th.Lock()
 
-            for list_email in df.columns:
+            def update_processed(delta=1):
+                with processed_lock:
+                    processed[0] += delta
+                    return processed[0]
+
+            # Step 1: Delete ALL existing distribution lists via Graph API (parallel)
+            # Thread count based on total member emails
+            num_members = int(total_members)
+            num_threads = 15 if num_members > 30 else 10
+
+            def delete_list_task(dl):
                 if progress_dialog.is_cancelled():
-                    break
+                    return
+                try:
+                    self.manager.delete_list(dl.id)
+                    with results_lock:
+                        results["lists_deleted"] += 1
+                except Exception as e:
+                    with results_lock:
+                        results["failed_delete"] += 1
+                        results["errors"].append(f"Delete {dl.mail}: {str(e)}")
+                p = update_processed()
+                self.after(0, lambda: progress_dialog.update_progress(p, f"Deleting lists..."))
 
-                # Find the distribution list
-                dl = self.manager.get_by_email(list_email)
-                if not dl:
-                    results["errors"].append(f"List not found: {list_email}")
+            with ThreadPoolExecutor(max_workers=num_threads) as executor:
+                executor.map(delete_list_task, current_lists)
+
+            # Step 2: Create new distribution lists via Exchange PowerShell (parallel)
+            # Column header = list email (e.g., sales@domain.com)
+            # Rows below = member emails
+            created_lists = {}  # Map email -> created successfully
+            created_lock = th.Lock()
+
+            def create_list_task(list_email):
+                if progress_dialog.is_cancelled():
+                    return
+
+                list_email_str = str(list_email).strip()
+                if not list_email_str or "@" not in list_email_str:
+                    with results_lock:
+                        results["errors"].append(f"Invalid list email: {list_email}")
+                    with created_lock:
+                        created_lists[list_email_str] = False
+                    update_processed()
+                    return
+
+                # Extract mail nickname (part before @) and use as display name
+                mail_nickname = list_email_str.split("@")[0]
+                display_name = mail_nickname.replace("-", " ").replace("_", " ").replace(".", " ").title()
+
+                p = update_processed()
+                self.after(0, lambda n=list_email_str: progress_dialog.update_progress(
+                    p, f"Creating {n[:25]}..."
+                ))
+
+                try:
+                    # Each thread gets its own ExchangeClient instance
+                    exchange = ExchangeClient()
+                    exchange.create_distribution_group(display_name, mail_nickname, list_email_str)
+                    with results_lock:
+                        results["lists_created"] += 1
+                    with created_lock:
+                        created_lists[list_email_str] = True
+                except Exception as e:
+                    with results_lock:
+                        results["failed_create"] += 1
+                        results["errors"].append(f"Create {list_email_str}: {str(e)}")
+                    with created_lock:
+                        created_lists[list_email_str] = False
+
+            with ThreadPoolExecutor(max_workers=num_threads) as executor:
+                executor.map(create_list_task, df.columns)
+
+            # Wait for Exchange to sync before adding members
+            if results["lists_created"] > 0:
+                self.after(0, lambda: progress_dialog.update_progress(
+                    processed[0], "Waiting for Exchange sync (30s)..."
+                ))
+                time.sleep(30)
+
+            # Step 3: Add members via Graph API (parallel)
+            # Refresh the manager's view of lists
+            try:
+                refreshed_lists = self.manager.list_all()
+                list_map = {dl.mail.lower(): dl for dl in refreshed_lists}
+            except Exception as e:
+                with results_lock:
+                    results["errors"].append(f"Failed to refresh lists: {str(e)}")
+                list_map = {}
+
+            # Build list of all member additions
+            member_tasks = []
+            for list_email in df.columns:
+                list_email_str = str(list_email).strip()
+                list_email_lower = list_email_str.lower()
+
+                # Skip if creation failed
+                if not created_lists.get(list_email_str, False):
+                    update_processed(df[list_email].notna().sum())
                     continue
 
-                results["lists_processed"] += 1
+                # Find the list in Graph API
+                dl = list_map.get(list_email_lower)
+                if not dl:
+                    with results_lock:
+                        results["errors"].append(f"List not found in Graph after creation: {list_email_str}")
+                    update_processed(df[list_email].notna().sum())
+                    continue
 
-                # Step 1: Remove all current members
-                current_members = self.manager.get_members(dl.id)
+                # Queue member additions
+                member_emails = df[list_email].dropna().tolist()
+                for member_email in member_emails:
+                    member_email = str(member_email).strip()
+                    if member_email and "@" in member_email:
+                        member_tasks.append((dl, member_email))
 
-                # Update total to include removals
-                total_operations = total_to_add + len(current_members)
-                self.after(0, lambda t=total_operations: setattr(progress_dialog, 'total', t))
+            def add_member_task(task):
+                dl, member_email = task
+                if progress_dialog.is_cancelled():
+                    return
 
-                for member in current_members:
-                    if progress_dialog.is_cancelled():
-                        break
+                p = update_processed()
+                self.after(0, lambda e=member_email, ln=dl.display_name: progress_dialog.update_progress(
+                    p, f"Adding {e[:20]} to {ln[:15]}..."
+                ))
 
-                    processed += 1
-                    self.after(0, lambda p=processed, e=member.email, ln=dl.display_name: progress_dialog.update_progress(
-                        p, f"Removing {e} from {ln[:15]}..."
-                    ))
-
-                    try:
-                        self.manager.remove_member(dl.id, member.email)
-                        results["removed"] += 1
-                    except Exception as e:
-                        results["failed_remove"] += 1
-                        results["errors"].append(f"Remove {member.email}: {str(e)[:30]}")
-
-                # Step 2: Add new members from CSV
-                emails_to_add = df[list_email].dropna().tolist()
-                for email in emails_to_add:
-                    if progress_dialog.is_cancelled():
-                        break
-
-                    email = str(email).strip()
-                    if not email or "@" not in email:
-                        processed += 1
-                        continue
-
-                    processed += 1
-                    self.after(0, lambda p=processed, e=email, ln=dl.display_name: progress_dialog.update_progress(
-                        p, f"Adding {e} to {ln[:15]}..."
-                    ))
-
-                    try:
-                        self.manager.add_member(dl.id, email)
-                        results["added"] += 1
-                    except Exception as e:
+                try:
+                    self.manager.add_member(dl.id, member_email)
+                    with results_lock:
+                        results["members_added"] += 1
+                except Exception as e:
+                    with results_lock:
                         results["failed_add"] += 1
-                        results["errors"].append(f"Add {email}: {str(e)[:30]}")
+                        results["errors"].append(f"Add {member_email} to {dl.mail}: {str(e)}")
+
+            with ThreadPoolExecutor(max_workers=num_threads) as executor:
+                executor.map(add_member_task, member_tasks)
 
             self.after(0, lambda: self._on_clear_and_import_complete(results, progress_dialog))
 
@@ -2315,27 +2713,31 @@ class DistributionListManagerGUI(ctk.CTk):
         if progress_dialog:
             progress_dialog.destroy()
 
-        message = (
-            f"Clear and Import Complete!\n\n"
-            f"Lists processed: {results['lists_processed']}\n"
-            f"Members removed: {results['removed']}\n"
-            f"Members added: {results['added']}\n"
-            f"Failed to remove: {results['failed_remove']}\n"
-            f"Failed to add: {results['failed_add']}"
+        summary = (
+            f"Lists deleted: {results.get('lists_deleted', 0)}\n"
+            f"Lists created: {results.get('lists_created', 0)}\n"
+            f"Members added: {results.get('members_added', 0)}\n"
+            f"Failed to delete: {results.get('failed_delete', 0)}\n"
+            f"Failed to create: {results.get('failed_create', 0)}\n"
+            f"Failed to add: {results.get('failed_add', 0)}"
         )
 
-        if results["errors"]:
-            message += f"\n\nErrors ({len(results['errors'])}):\n"
-            message += "\n".join(results["errors"][:10])
-            if len(results["errors"]) > 10:
-                message += f"\n...and {len(results['errors']) - 10} more"
+        has_failures = (results.get("failed_delete", 0) > 0 or
+                       results.get("failed_create", 0) > 0 or
+                       results.get("failed_add", 0) > 0)
 
-        if results["failed_remove"] > 0 or results["failed_add"] > 0:
-            messagebox.showwarning("Complete with Errors", message)
+        if has_failures and results.get("errors"):
+            # Show copyable error dialog
+            ErrorLogDialog(
+                self,
+                "Import Complete with Errors",
+                summary,
+                results["errors"]
+            )
         else:
-            messagebox.showinfo("Success", message)
+            messagebox.showinfo("Success", f"Delete and Import Complete!\n\n{summary}")
 
-        # Reload full cache after clear and import
+        # Reload full cache after import
         self._reload_cache()
 
     def _search_email_memberships(self):
